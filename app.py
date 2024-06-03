@@ -1,4 +1,3 @@
-import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import cv2
@@ -7,6 +6,9 @@ from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import io
 from googletrans import Translator, LANGUAGES
+from skimage import filters
+from skimage.morphology import skeletonize
+from scipy.ndimage import interpolation as inter
 
 app = Flask(__name__)
 CORS(app)
@@ -16,32 +18,47 @@ pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tessera
 
 translator = Translator()
 
-def get_font_size(draw, boxes):
-    # Calculate the average height of characters
-    total_height = sum([bh for _, _, _, bh in boxes])
-    average_height = total_height / len(boxes)
+def check_collision(box1, box2):
+    x1, y1, w1, h1 = box1
+    x2, y2, w2, h2 = box2
+    
+    if x1 < x2 + w2 and x1 + w1 > x2 and y1 < y2 + h2 and y1 + h1 > y2:
+        return True
+    return False
 
-    # Choose a font size based on the average height of characters
-    font_size = int(average_height * 1.4)  # Adjust as needed
-    return ImageFont.truetype("arial.ttf", font_size)
-
-def wrap_text(text, font, max_width):
-    """Wrap text to fit within a given width when rendered."""
+def split_text_into_lines(text, font, max_width):
     lines = []
     words = text.split()
     current_line = ''
     for word in words:
-        # Measure the width of the text with getbbox()
+        # Calculate the width of the current line with the new word
         temp_line = current_line + (word + ' ')
-        temp_line_width = font.getbbox(temp_line)[2]
+        temp_mask = font.getmask(temp_line)
+        temp_line_width, _ = temp_mask.size
+        # If the width exceeds the maximum width, start a new line
         if temp_line_width <= max_width:
             current_line = temp_line
         else:
             lines.append(current_line)
             current_line = word + ' '
-    if current_line:
-        lines.append(current_line)
-    return '\n'.join(lines)
+    # Add the last line
+    lines.append(current_line)
+    return lines
+
+def preprocess_image(file):
+    if file:
+        img = Image.open(io.BytesIO(file.read()))
+        img = img.convert('RGB')
+        img_np = np.array(img)
+
+        # Convert to grayscale
+        gray_img = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
+
+        # Use pytesseract to do OCR on the preprocessed image
+        data = pytesseract.image_to_data(gray_img, output_type=pytesseract.Output.DICT)
+        
+        return img, data
+
 
 @app.route('/translate_and_replace', methods=['POST'])
 def translate_and_replace():
@@ -51,145 +68,74 @@ def translate_and_replace():
     if target_lang not in LANGUAGES:
         return jsonify({"error": "Invalid target language"}), 400
     
-    if file:
-        # Read image file
-        img = Image.open(io.BytesIO(file.read()))
-        img = img.convert('RGB')
-        img_np = np.array(img)
+   
+    img, data = preprocess_image(file)
         
-        # Convert to grayscale
-        gray_img = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
+    if not data or 'text' not in data or data['text'] is None:
+        return jsonify({"error": "OCR failed or no text detected"}), 400
 
-        # Perform OCR
-        data = pytesseract.image_to_data(gray_img, output_type=pytesseract.Output.DICT)
-        
-        # Check if 'text' and other keys are present and not None
-        if not data or 'text' not in data or data['text'] is None:
-            return jsonify({"error": "OCR failed or no text detected"}), 400
+    draw = ImageDraw.Draw(img)
+    word_positions = []
 
-        draw = ImageDraw.Draw(img)
+    # Collect word positions and adjust bounding boxes
+    for i in range(len(data['text'])):
+        text = data['text'][i].strip()
+        if text and int(data['conf'][i]) > 0:
+            x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+            adjusted_box = (x - 10, y - 10, w + 20, h + 20)  # Increase box size
+            word_positions.append((text, adjusted_box))
+            print(f"{text} - Original: ({x}, {y}, {w}, {h}), Adjusted: {adjusted_box}")
 
-        # Initialize variables to combine words into sentences
-        combined_text = ""
-        combined_boxes = []
-        last_y = None
+    # Check for collisions and group related words
+    groups = []
+    for i in range(len(word_positions)):
+        found = False
+        for group in groups:
+            if any(check_collision(word_positions[i][1], word_positions[j][1]) for j in group):
+                group.append(i)
+                found = True
+                break
+        if not found:
+            groups.append([i])
 
-        for i in range(len(data['text'])):
-            text = data['text'][i]
-            if text and int(data['conf'][i]) > 0:  # Filter out weak OCR results
-                x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+    # Calculate average height of text in the box
+    average_height = sum(h for _, (_, _, _, h) in word_positions) / len(word_positions)
+    fontsize = int(average_height * 0.6)
+    font = ImageFont.truetype("arial.ttf", fontsize)
+    print("average_height", average_height)
 
-                # Check vertical distance condition
-                if last_y is not None and abs(y - last_y) > 35:
-                    if combined_text.strip():
-                        try:
-                            # Translate the combined text
-                            translated_text = translator.translate(combined_text, dest=target_lang).text
-                        except Exception as e:
-                            translated_text = combined_text
-                            print(f"Translation error: {e}")
-                        if translated_text is None:
-                            translated_text = combined_text
-
-                        # Calculate the bounding box for the translated text
-                        max_x = max([bx + bw for bx, by, bw, bh in combined_boxes])
-                        max_y = max([by + bh for bx, by, bw, bh in combined_boxes])
-                        min_x = min([bx for bx, by, bw, bh in combined_boxes])
-                        min_y = min([by for bx, by, bw, bh in combined_boxes])
-
-                        # Get the appropriate font size
-                        translated_font = get_font_size(draw, combined_boxes)
-                        
-                        # Wrap the translated text
-                        wrapped_text = wrap_text(translated_text, translated_font, max_x - min_x)
-
-                        # Draw a white rectangle over the original text
-                        draw.rectangle([(min_x, min_y), (max_x, max_y)], fill='white')
-
-                        # Draw the translated text on the image
-                        draw.text((min_x, min_y), wrapped_text, fill='black', font=translated_font)
-
-                    # Reset combined text and boxes for the next sentence
-                    combined_text = ""
-                    combined_boxes = []
-
-                if combined_text:
-                    combined_text += " " + text
-                else:
-                    combined_text = text
-                
-                combined_boxes.append((x, y, w, h))
-                last_y = y
-
-                # Check if the current text ends with a period
-                if text.endswith('.'):
-                    if combined_text.strip():
-                        try:
-                            # Translate the combined text
-                            translated_text = translator.translate(combined_text, dest=target_lang).text
-                        except Exception as e:
-                            translated_text = combined_text
-                            print(f"Translation error: {e}")
-                        if translated_text is None:
-                            translated_text = combined_text
-
-                        # Calculate the bounding box for the translated text
-                        max_x = max([bx + bw for bx, by, bw, bh in combined_boxes])
-                        max_y = max([by + bh for bx, by, bw, bh in combined_boxes])
-                        min_x = min([bx for bx, by, bw, bh in combined_boxes])
-                        min_y = min([by for bx, by, bw, bh in combined_boxes])
-
-                        # Get the appropriate font size
-                        translated_font = get_font_size(draw, combined_boxes)
-                        
-                        # Wrap the translated text
-                        wrapped_text = wrap_text(translated_text, translated_font, max_x - min_x)
-
-                        # Draw a white rectangle over the original text
-                        draw.rectangle([(min_x, min_y), (max_x, max_y)], fill='white')
-
-                        # Draw the translated text on the image
-                        draw.text((min_x, min_y), wrapped_text, fill='black', font=translated_font)
-
-                    # Reset combined text and boxes for the next sentence
-                    combined_text = ""
-                    combined_boxes = []
-
-        # Handle any remaining combined text (if not ended with a period)
-        if combined_text.strip():
-            try:
-                translated_text = translator.translate(combined_text, dest=target_lang).text
-            except Exception as e:
-                translated_text = combined_text
-                print(f"Translation error: {e}")
-            if translated_text is None:
-                translated_text = combined_text
-
-            # Calculate the bounding box for the translated text
-            max_x = max([bx + bw for bx, by, bw, bh in combined_boxes])
-            max_y = max([by + bh for bx, by, bw, bh in combined_boxes])
-            min_x = min([bx for bx, by, bw, bh in combined_boxes])
-            min_y = min([by for bx, by, bw, bh in combined_boxes])
-
-            # Get the appropriate font size
-            translated_font = get_font_size(draw, combined_boxes)
+    # Draw boxes around groups of colliding words
+    for group in groups:
+        if len(group) > 1:  # Only draw if there are collisions
+            min_x = min(word_positions[i][1][0] for i in group)
+            min_y = min(word_positions[i][1][1] for i in group)
+            max_x = max(word_positions[i][1][0] + word_positions[i][1][2] for i in group)
+            max_y = max(word_positions[i][1][1] + word_positions[i][1][3] for i in group)
+    
+            # Sort words left to right, top to bottom
+            group_sorted = sorted(group, key=lambda i: (word_positions[i][1][1], word_positions[i][1][0]))
+            sentence = " ".join(word_positions[i][0] for i in group_sorted)
             
-            # Wrap the translated text
-            wrapped_text = wrap_text(translated_text, translated_font, max_x - min_x)
+            # Translate sentence
+            translated_sentence = translator.translate(sentence, dest=target_lang).text
 
-            # Draw a white rectangle over the original text
-            draw.rectangle([(min_x, min_y), (max_x, max_y)], fill='white')
+            draw.rectangle([min_x, min_y, max_x, max_y], outline="red", width=2)
+            draw.rectangle([min_x, min_y, max_x, max_y], fill="white")  # White out the original text
 
-            # Draw the translated text on the image
-            draw.text((min_x, min_y), wrapped_text, fill='black', font=translated_font)
+            translated_lines = split_text_into_lines(translated_sentence, font, max_x - min_x)
 
-        # Save the modified image to a buffer
-        img_buffer = io.BytesIO()
-        img.save(img_buffer, format='PNG')
-        img_buffer.seek(0)
+            y_text = min_y
+            for line in translated_lines:
+                draw.text((min_x, y_text), line, fill="black", font=font)
+                # Move to the next line by using the ascent and descent values of the font
+                ascent, descent = font.getmetrics()
+                y_text += ascent + descent
+          
+    img_buffer = io.BytesIO()
+    img.save(img_buffer, format='PNG')
+    img_buffer.seek(0)
 
-        return jsonify({"image": img_buffer.getvalue().hex()})
-    return jsonify({"error": "No file uploaded"}), 400
+    return jsonify({"image": img_buffer.getvalue().hex()})
 
 if __name__ == '__main__':
     app.run(debug=True)

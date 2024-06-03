@@ -94,16 +94,16 @@ export default function Home() {
         onChange={handleImageUpload}
         className="block w-full text-sm text-gray-900 border border-gray-300 rounded-lg cursor-pointer bg-gray-50 focus:outline-none"
       />
-      <div className="flex gap-4 mt-4 ">
+      <div className="flex gap-4 mt-4 flex-wrap">
         {selectedImages.map((image, index) => (
           <div
             key={index}
-            className="text-center flex flex-row justify-around w-full"
+            className="text-center flex flex-row justify-around w-full flex-wrap"
           >
             <img
               src={URL.createObjectURL(image)}
               alt={`Selected ${index}`}
-              className="max-w-xs mt-4"
+              className="mt-4 h-screen"
             />
             <div className="flex flex-row">
               {translatedImages[index] && (
@@ -111,7 +111,7 @@ export default function Home() {
                   <img
                     src={translatedImages[index]}
                     alt={`Translated ${index}`}
-                    className="max-w-xs mt-4"
+                    className="h-screen mt-4"
                   />
                   <button
                     onClick={() =>
